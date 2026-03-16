@@ -1,0 +1,10 @@
+*/ckpt/
+*/logs/
+*/temp_data/
+
+data/LiveCodeBench.json
+data/MATH_train.json
+data/MATH500.json
+data/SEEDBench_IMG_32.json
+data/sft_test_v.json
+data/PrimeIntellect.json

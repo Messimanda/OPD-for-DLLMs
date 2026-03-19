@@ -167,7 +167,9 @@ def main():
     #model = AutoModelForCausalLM.from_pretrained(pretrained_model, trust_remote_code=True, torch_dtype="auto")
     model = SDARForCausalLM.from_pretrained(pretrained_model, trust_remote_code=True, torch_dtype="auto")
 
-    # Optional ExOPD teacher model (e.g. TraDo-4B-Instruct)
+    use_exopd_paper = (config.training.get("method", "TraceRL") == "ExOPD")
+
+    # Optional ExOPD teacher model (required when method=ExOPD)
     teacher_model = None
     teacher_path = OmegaConf.select(config, "model.teacher_model", default=None)
     if teacher_path is not None:
@@ -177,6 +179,22 @@ def main():
         )
         teacher_model.eval()
         for p in teacher_model.parameters():
+            p.requires_grad = False
+
+    # ExOPD paper: reference model π_ref (required when method=ExOPD). null => student base.
+    ref_model = None
+    if use_exopd_paper:
+        if teacher_model is None:
+            raise ValueError("training.method=ExOPD requires model.teacher_model to be set.")
+        ref_path = OmegaConf.select(config, "model.reference_model", default=None)
+        if ref_path is None:
+            ref_path = config.model.pretrained_model  # student base
+        logger.info(f"ExOPD: loading reference model π_ref from {ref_path}")
+        ref_model = SDARForCausalLM.from_pretrained(
+            ref_path, trust_remote_code=True, torch_dtype="auto"
+        )
+        ref_model.eval()
+        for p in ref_model.parameters():
             p.requires_grad = False
 
     # calculate loss ourselves, needs logits，so aviod fuse CE
@@ -193,6 +211,8 @@ def main():
 
     if teacher_model is not None:
         teacher_model = teacher_model.to(accelerator.device)
+    if ref_model is not None:
+        ref_model = ref_model.to(accelerator.device)
 
     mask_id = tokenizer.mask_token_id
     pad_id = tokenizer.pad_token_id
@@ -362,6 +382,13 @@ def main():
 
 
     dataset_lm = TrainDataset(extended_input_ids, p_mask, tok_idx_ext, labels, adv)
+    if use_exopd_paper:
+        dataset_lm.logp_teacher_tok = torch.full(
+            (len(extended_input_ids), p_mask.shape[1]), float("-inf")
+        )
+        dataset_lm.logp_ref_tok = torch.full(
+            (len(extended_input_ids), p_mask.shape[1]), float("-inf")
+        )
 
     total_batch_size_lm = config.training.batch_size_lm * accelerator.num_processes * config.training.gradient_accumulation_steps
     num_update_steps_per_epoch = math.ceil(len(dataset_lm) / total_batch_size_lm)
@@ -449,6 +476,37 @@ def main():
 
         model.train()
 
+    def compute_logp_teacher_ref_parallel(
+            accel, dataset, train_dl, start_pos, pad_id,
+            teacher_model, ref_model, basic_block_attention, process_pad,
+    ):
+        """ExOPD paper: fill log π_teacher and log π_ref per token."""
+        teacher_model.eval()
+        ref_model.eval()
+        model.eval()
+        for batch in train_dl:
+            ids = batch["ids"]
+            extended_input_ids = batch["extended_input_ids"].to(accel.device)
+            p_mask = batch["p_mask"].to(accel.device)
+            tok_idx_ext = batch["tok_idx_ext"].to(accel.device)
+            labels = batch["labels"].to(accel.device)
+            B, L = p_mask.shape
+            L0, L1 = start_pos, L - start_pos
+            device = extended_input_ids.device
+            attention_mask = basic_block_attention.clone()
+            attention_mask = attention_mask.repeat_interleave(B, dim=0).to(device)
+            attention_mask = process_pad(attention_mask, extended_input_ids)
+            with torch.no_grad():
+                t_logits = teacher_model(input_ids=extended_input_ids, attention_mask=attention_mask, position_ids=tok_idx_ext).logits
+                t_logits = torch.cat([t_logits[:, :L0, :], t_logits[:, L0 + L1 :, :]], dim=1)
+                logp_teacher = F.log_softmax(t_logits, dim=-1).gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+                r_logits = ref_model(input_ids=extended_input_ids, attention_mask=attention_mask, position_ids=tok_idx_ext).logits
+                r_logits = torch.cat([r_logits[:, :L0, :], r_logits[:, L0 + L1 :, :]], dim=1)
+                logp_ref = F.log_softmax(r_logits, dim=-1).gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+            dataset.logp_teacher_tok[ids] = logp_teacher.float().cpu()
+            dataset.logp_ref_tok[ids] = logp_ref.float().cpu()
+        accel.wait_for_everyone()
+        model.train()
 
     #################################
     #             Inference         #
@@ -463,6 +521,13 @@ def main():
         pad_id=pad_id,
         batch_size=config.training.batch_size_lm,
     )
+    if use_exopd_paper:
+        logger.info("***** ExOPD: computing log π_teacher and log π_ref *****")
+        compute_logp_teacher_ref_parallel(
+            accelerator, dataset_lm, train_dataloader_lm,
+            start_pos, pad_id, teacher_model, ref_model,
+            basic_block_attention, process_pad,
+        )
 
 
 
@@ -522,11 +587,11 @@ def main():
 
         policy_loss = - (surrogate_tok.sum() / B)
 
-        # ---------- ExOPD: reward scaling ----------
-        if alpha_exopd != 1.0:
+        # ---------- ExOPD paper: no reward scaling here (adv already = λ*(log π* - log π_ref)) ----------
+        if not use_exopd_paper and alpha_exopd != 1.0:
             policy_loss = alpha_exopd * policy_loss
 
-        # ---------- 6. KL penalty（可选） ----------
+        # ---------- 6. KL penalty (optional; ExOPD uses only KL to π_ref below) ----------
         kl_loss = torch.tensor(0.0, device=policy_loss.device)
         if config.training.beta > 0:
             kl_seq = logp_new_tok - logp_old_tok
@@ -540,8 +605,28 @@ def main():
         else:
             total_loss = policy_loss
 
-        # ---------- ExOPD: teacher KL regularization ----------
-        if (teacher_model is not None) and (lambda_teacher > 0.0):
+        # ---------- ExOPD paper: KL(π_θ || π_ref) ----------
+        if use_exopd_paper and (ref_model is not None):
+            kl_ref_weight = config.training.get("kl_ref_weight", 1.0)
+            with torch.no_grad():
+                ref_logits = ref_model(
+                    input_ids=extended_input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=tok_idx_ext,
+                ).logits
+                ref_logits = torch.cat(
+                    [ref_logits[:, :L0, :], ref_logits[:, L0 + L1 :, :]],
+                    dim=1,
+                )
+                ref_log_probs = F.log_softmax(ref_logits, dim=-1)
+            student_log_probs = log_probs
+            p_student = student_log_probs.exp()
+            kl_token = p_student * (student_log_probs - ref_log_probs)
+            kl_token = kl_token.sum(dim=-1) * p_mask
+            kl_ref = (kl_token.sum(dim=1) / L1).mean()
+            total_loss = total_loss + kl_ref_weight * kl_ref
+        # ---------- Legacy: teacher KL (only when not ExOPD) ----------
+        elif (teacher_model is not None) and (lambda_teacher > 0.0):
             with torch.no_grad():
                 teacher_logits = teacher_model(
                     input_ids=extended_input_ids,
@@ -553,16 +638,11 @@ def main():
                     dim=1,
                 )
                 teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
-
-            # KL(student || teacher) per token
-            student_log_probs = log_probs  # (B, L0+L1, V)
+            student_log_probs = log_probs
             p_student = student_log_probs.exp()
-            kl_token = p_student * (student_log_probs - teacher_log_probs)  # (B, L, V)
-            kl_token = kl_token.sum(dim=-1)  # (B, L)
-            kl_token = kl_token * p_mask
-            kl_seq = kl_token.sum(dim=1) / L1  # (B,)
-            kl_teacher = kl_seq.mean()
-
+            kl_token = p_student * (student_log_probs - teacher_log_probs)
+            kl_token = kl_token.sum(dim=-1) * p_mask
+            kl_teacher = (kl_token.sum(dim=1) / L1).mean()
             total_loss = total_loss + lambda_teacher * kl_teacher
 
         return total_loss
@@ -598,8 +678,16 @@ def main():
             p_mask = batch["p_mask"].to(accelerator.device)
             tok_idx_ext = batch["tok_idx_ext"].to(accelerator.device)
             labels = batch["labels"].to(accelerator.device)
-            adv = batch["adv"].to(accelerator.device)
-            old_lp = dataset_lm.logp_old_tok[batch["ids"].cpu()].to(accelerator.device)
+            ids_cpu = batch["ids"].cpu()
+            if use_exopd_paper:
+                lambda_exopd = config.training.get("lambda_exopd", 1.25)
+                adv = (lambda_exopd * (
+                    dataset_lm.logp_teacher_tok[ids_cpu].to(accelerator.device)
+                    - dataset_lm.logp_ref_tok[ids_cpu].to(accelerator.device)
+                ))
+            else:
+                adv = batch["adv"].to(accelerator.device)
+            old_lp = dataset_lm.logp_old_tok[ids_cpu].to(accelerator.device)
 
             if torch.isneginf(old_lp).any().item():
                 print(old_lp)

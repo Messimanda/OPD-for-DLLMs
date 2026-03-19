@@ -193,18 +193,28 @@ if __name__ == "__main__":
             else:
                 block_size_list = config.evaluation.block_size
                 remasking_strategy_list = config.evaluation.remasking_strategy
+
+                # `evaluation.top_k` may be absent, a single value, or a list.
                 if OmegaConf.select(config, "evaluation.top_k", default=MISSING) is not MISSING:
-                    top_k = config.evaluation.top_k
+                    top_k_cfg = config.evaluation.top_k
                 else:
-                    top_k = None
+                    top_k_cfg = None
+
                 for j in range(len(remasking_strategy_list)):
                     remasking_strategy = remasking_strategy_list[j]
+
+                    if isinstance(top_k_cfg, (list, ListConfig)):
+                        top_k = top_k_cfg[j]
+                    else:
+                        top_k = top_k_cfg
+
                     if model_base == "dream":
                         block_size = block_size_list[j]
                     elif model_base == "llada" or model_base == "mmada":
                         block_size = config.evaluation.block_size
                     else:
                         block_size = config.evaluation.block_size  # trado, sdar
+
                     sample(i, "evaluation", block_size = block_size, top_k = top_k, remasking_strategy = remasking_strategy)
                     if is_code_task:
                         execute(i, "evaluation")

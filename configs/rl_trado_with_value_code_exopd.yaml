@@ -21,7 +21,8 @@ model:
     pretrained_model: "/data/share/SDAR-4B-Chat" # absolute path of your model
     value_base_model: "/data/share/SDAR-4B-Chat" # absolute path of your model
     # optional teacher model for ExOPD-style training (e.g. TraDo-4B-Instruct)
-    teacher_model: null  # "/abs/path/of/TraDo-4B-Instruct"
+    teacher_model: "../rl_trado_with_value_code/ckpt/optimized"  # RL-trained teacher ckpt
+    reference_model: null  # π_ref: null = student base; or teacher base for reward correction
     optimized_name: "optimized" # the output name for your optimized policy model, will be saved under project/ckpt
     optimized_value_name: "optimized_value" # the output name for your optimized value model, will be saved under project/ckpt
     model_base: "trado"
@@ -61,20 +62,20 @@ training:
     seed: 10086
     num_train_epochs: 1
     max_grad_norm: 1.0
-    method: "TraceRL" # "random_masking" "TraceRL" "coupled"
+    method: "ExOPD" # paper-style distillation (requires teacher_model)
     block_size: 4
     shrink: 1
     post_num: 0
     max_gen_length: 2000
     max_prompt_len: 784
     eps: 0.20
-    beta: 0.01
+    beta: 0.0
     gam: 1.0
     lam: 1.0
     use_kl_estimator_k3: True
     # ExOPD-related hyperparameters
-    alpha_exopd: 1.0        # reward scaling (>1.0 enables reward extrapolation)
-    lambda_teacher: 1.0     # KL(student || teacher) coefficient
+    lambda_exopd: 1.25     # λ in paper: reward scaling (>1 = reward extrapolation)
+    kl_ref_weight: 1.0     # weight for KL(student || π_ref)
 
 
 optimizer:
